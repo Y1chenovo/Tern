@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux GUI & D-Bus system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libdbus-1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libgl1-mesa-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (GUI default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (CLI only, --no-default-features)
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+      - name: Run tests (GUI default features)
+        run: cargo test --locked --no-fail-fast
+
+      - name: Run tests (CLI only, --no-default-features)
+        run: cargo test --locked --no-default-features --no-fail-fast

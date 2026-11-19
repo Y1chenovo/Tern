@@ -1,0 +1,11 @@
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
+# Prefer fully static CRT / libgcc / libstdc++ / winpthread so the EXE
+# does not need mingw runtime DLLs on a clean Windows install.
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-static-libgcc",
+    "-C", "link-arg=-static-libstdc++",
+]

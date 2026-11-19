@@ -1,0 +1,62 @@
+[package]
+name = "tern"
+version = "1.0.0"
+edition = "2021"
+authors = ["Yichenovo"]
+description = "Tern — SSH & SFTP client with multi-host group control that binds outbound TCP to a non-TUN interface to bypass the local VPN"
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/Y1chenovo/Tern"
+repository = "https://github.com/Y1chenovo/Tern"
+rust-version = "1.89"
+keywords = ["ssh", "sftp", "terminal", "vpn-bypass", "egui"]
+categories = ["command-line-utilities", "gui", "network-programming"]
+
+[[bin]]
+name = "tern"
+path = "src/main.rs"
+
+[build-dependencies]
+# Embeds the app icon + version info into tern.exe (Windows targets only).
+winresource = "0.1"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui", "dep:vt100", "dep:chrono"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.29"
+eframe = { version = "0.31", default-features = true, features = ["persistence"], optional = true }
+egui = { version = "0.31", optional = true }
+if-addrs = "0.13"
+rpassword = "7"
+russh = { version = "0.63", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "2.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+vt100 = { version = "0.16", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+
+# OS credential store for remembered passwords (Windows Credential Manager).
+keyring = { version = "3", default-features = false }
+bytes = "1"
+unicode-width = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+getrandom = { version = "0.2", features = ["std"] }  # std: Error implements std::error::Error on every platform
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["net", "socket", "uio"] }
+# Secret Service (GNOME Keyring / KWallet) over D-Bus, pure Rust.
+keyring = { version = "3", default-features = false, features = ["async-secret-service", "async-io", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Controls", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_System_Com"] }
+raw-window-handle = "0.6"
+keyring = { version = "3", default-features = false, features = ["windows-native"] }

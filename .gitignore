@@ -1,0 +1,19 @@
+# Rust / Cargo build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Crash & runtime logs
+tern-crash.log
+
+# IDE & editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
