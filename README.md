@@ -17,12 +17,12 @@
 </p>
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/preview-en-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="assets/preview-en-light.png">
-    <img alt="Tern Desktop Interface" src="assets/preview-en-dark.png" width="900">
-  </picture>
+  <img src="assets/preview-en-dark.png" alt="Tern Desktop Interface (Dark)" width="880">
 </p>
+
+| Light Theme | Built-in Chinese UI (简体中文) |
+| :---: | :---: |
+| <img src="assets/preview-en-light.png" alt="Tern Light Theme" width="430"> | <img src="assets/preview-zh-dark.png" alt="Tern Chinese UI" width="430"> |
 
 ---
 

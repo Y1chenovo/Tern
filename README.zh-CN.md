@@ -17,12 +17,12 @@
 </p>
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/preview-zh-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="assets/preview-zh-light.png">
-    <img alt="Tern 桌面界面预览" src="assets/preview-zh-dark.png" width="900">
-  </picture>
+  <img src="assets/preview-zh-dark.png" alt="Tern 桌面界面（深色模式）" width="880">
 </p>
+
+| 浅色主题（Light Theme） | 内置英文界面（English UI） |
+| :---: | :---: |
+| <img src="assets/preview-zh-light.png" alt="Tern 浅色主题" width="430"> | <img src="assets/preview-en-dark.png" alt="Tern 英文界面" width="430"> |
 
 ---
 
