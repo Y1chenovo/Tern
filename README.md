@@ -16,6 +16,14 @@
   <b>English</b> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/preview-en-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/preview-en-light.png">
+    <img alt="Tern Desktop Interface" src="assets/preview-en-dark.png" width="900">
+  </picture>
+</p>
+
 ---
 
 ## Why Tern?
