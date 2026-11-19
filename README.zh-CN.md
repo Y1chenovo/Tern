@@ -16,13 +16,10 @@
   <a href="README.md">English</a> · <b>简体中文</b>
 </p>
 
-<p align="center">
-  <img src="assets/preview-zh-dark.png" alt="Tern 桌面界面（深色模式）" width="880">
-</p>
-
-| 浅色主题（Light Theme） | 内置英文界面（English UI） |
+| 简体中文 | English |
 | :---: | :---: |
-| <img src="assets/preview-zh-light.png" alt="Tern 浅色主题" width="430"> | <img src="assets/preview-en-dark.png" alt="Tern 英文界面" width="430"> |
+| <img src="assets/preview-zh-light.png" alt="Tern 中文界面（浅色）" width="430"> | <img src="assets/preview-en-light.png" alt="Tern 英文界面（浅色）" width="430"> |
+| <img src="assets/preview-zh-dark.png" alt="Tern 中文界面（深色）" width="430"> | <img src="assets/preview-en-dark.png" alt="Tern 英文界面（深色）" width="430"> |
 
 ---
 

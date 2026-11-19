@@ -16,13 +16,10 @@
   <b>English</b> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-<p align="center">
-  <img src="assets/preview-en-dark.png" alt="Tern Desktop Interface (Dark)" width="880">
-</p>
-
-| Light Theme | Built-in Chinese UI (简体中文) |
+| English | 简体中文 |
 | :---: | :---: |
-| <img src="assets/preview-en-light.png" alt="Tern Light Theme" width="430"> | <img src="assets/preview-zh-dark.png" alt="Tern Chinese UI" width="430"> |
+| <img src="assets/preview-en-light.png" alt="Tern English UI (Light)" width="430"> | <img src="assets/preview-zh-light.png" alt="Tern Chinese UI (Light)" width="430"> |
+| <img src="assets/preview-en-dark.png" alt="Tern English UI (Dark)" width="430"> | <img src="assets/preview-zh-dark.png" alt="Tern Chinese UI (Dark)" width="430"> |
 
 ---
 
