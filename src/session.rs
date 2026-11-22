@@ -1274,24 +1274,22 @@ pub async fn sftp_list(
                 let meta = item.metadata();
                 items.push((name, meta));
             }
-            let mut links = stream::iter(
-                items
-                    .iter()
-                    .filter(|(_, meta)| {
-                        matches!(meta.file_type(), russh_sftp::protocol::FileType::Symlink)
-                    })
-                    .map(|(name, _)| {
-                        let s = Arc::clone(&sftp);
-                        let target = child_path(&path, name);
-                        async move {
-                            let (meta, link_target) = tokio::join!(
-                                s.metadata(target.as_str()),
-                                s.read_link(target.as_str()),
-                            );
-                            (name.clone(), (meta.ok(), link_target.ok()))
-                        }
-                    }),
-            )
+            let link_names: Vec<String> = items
+                .iter()
+                .filter(|(_, meta)| {
+                    matches!(meta.file_type(), russh_sftp::protocol::FileType::Symlink)
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            let mut links = stream::iter(link_names.into_iter().map(|name| {
+                let s = Arc::clone(&sftp);
+                let target = child_path(&path, &name);
+                async move {
+                    let (meta, link_target) =
+                        tokio::join!(s.metadata(target.as_str()), s.read_link(target.as_str()),);
+                    (name, (meta.ok(), link_target.ok()))
+                }
+            }))
             .buffer_unordered(16);
             let mut resolved = std::collections::HashMap::new();
             while let Some((n, pair)) = links.next().await {

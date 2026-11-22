@@ -23,18 +23,25 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::{TcpSocket, TcpStream};
 
-/// Interface-name prefixes / substrings treated as VPN / tunnel devices.
-const TUNNEL_PREFIXES: &[&str] = &[
-    "tun",
-    "tap",
-    "wg",
-    "utun",
-    "nordlynx",
-    "ppp",
+/// Short interface-name prefixes matched only on token boundaries (`tun`, `tun0`,
+/// `wg-mullvad`, `TAP-Windows`, etc.), avoiding false positives on words such as
+/// `"Tuning"`, `"Opportunistic"`, or `"AWG"`.
+const TUNNEL_TOKEN_PREFIXES: &[&str] = &["tun", "tap", "wg", "utun", "ppp"];
+
+/// Specific VPN / tunnel driver keywords matched anywhere in the lowercase name/description.
+const TUNNEL_KEYWORDS: &[&str] = &[
     "wintun",
     "wireguard",
+    "nordlynx",
+    "tailscale",
+    "zerotier",
+    "openvpn",
+    "cloudflarewarp",
     "isatap",
     "teredo",
+    "mihomo",
+    "singbox",
+    "sing-box",
 ];
 
 /// How long to wait for the TCP handshake before giving up.
@@ -476,7 +483,7 @@ fn auto_detect_non_tun_iface() -> Result<(String, Ipv4Addr)> {
     let mut routes: Vec<_> = parse_default_routes()
         .unwrap_or_default()
         .into_iter()
-        .filter(|r| !is_tunnel_iface(&r.iface))
+        .filter(|r| !is_linux_tunnel_iface(&r.iface))
         .collect();
     routes.sort_by_key(|r| r.metric);
     for route in &routes {
@@ -488,7 +495,7 @@ fn auto_detect_non_tun_iface() -> Result<(String, Ipv4Addr)> {
     ifaces.sort_by_key(|(name, _)| iface_preference_score(name));
     ifaces
         .into_iter()
-        .find(|(name, _)| !is_tunnel_iface(name) && name != "lo")
+        .find(|(name, _)| !is_linux_tunnel_iface(name) && name != "lo")
         .context("no suitable non-TUN IPv4 found; pass --bind-addr or --bind-iface explicitly")
 }
 
@@ -547,12 +554,75 @@ async fn connect_bound_device(remote: SocketAddr, local: IpAddr, iface: &str) ->
         .with_context(|| format!("connect({remote}) via {iface} failed"))
 }
 
-/// Returns true if `name` looks like a tunnel / VPN virtual NIC.
+/// Returns true if `name` (or an adapter description) looks like a tunnel / VPN virtual NIC.
 pub fn is_tunnel_iface(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    TUNNEL_PREFIXES
-        .iter()
-        .any(|p| lower == *p || lower.starts_with(p) || lower.contains(p))
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    if TUNNEL_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return true;
+    }
+    // ZeroTier interfaces on Linux/macOS/BSD are `zt` + base32 network/node ID (e.g. `ztcf23aa10`).
+    if lower.starts_with("zt")
+        && lower.len() >= 8
+        && lower[2..].bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return true;
+    }
+    for tok in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if tok.is_empty() {
+            continue;
+        }
+        for &p in TUNNEL_TOKEN_PREFIXES {
+            if tok == p
+                || tok
+                    .strip_prefix(p)
+                    .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Inspect Linux `/sys/class/net/<name>` to catch custom-named TUN/TAP, WireGuard,
+/// PPP, or IP-in-IP tunnel devices (e.g. `Meta`, `clash`, `corp-vpn`).
+#[cfg(target_os = "linux")]
+fn is_linux_sysfs_tunnel(name: &str) -> bool {
+    use std::path::Path;
+    if name.is_empty() || name.contains(['/', '\0']) {
+        return false;
+    }
+    let sys_dir = Path::new("/sys/class/net").join(name);
+    if sys_dir.join("tun_flags").exists() {
+        return true;
+    }
+    if let Ok(raw_type) = std::fs::read_to_string(sys_dir.join("type")) {
+        if let Ok(arp_type) = raw_type.trim().parse::<u32>() {
+            // 512=PPP, 768=IPIP, 769=IP6IP6, 776=SIT, 778=GRE, 65534=NONE (TUN/WireGuard/Tailscale)
+            if matches!(arp_type, 512 | 768 | 769 | 776 | 778 | 65534) {
+                return true;
+            }
+        }
+    }
+    if let Ok(uevent) = std::fs::read_to_string(sys_dir.join("uevent")) {
+        if uevent.lines().any(|l| {
+            matches!(
+                l.trim(),
+                "DEVTYPE=wireguard" | "DEVTYPE=ppp" | "DEVTYPE=ipip" | "DEVTYPE=gre"
+            )
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn is_linux_tunnel_iface(name: &str) -> bool {
+    is_tunnel_iface(name) || is_linux_sysfs_tunnel(name)
 }
 
 /// A candidate local interface + IPv4 for the GUI picker / CLI auto-detect.
@@ -577,7 +647,11 @@ pub fn list_bind_candidates() -> Result<Vec<IfaceCandidate>> {
         list_ipv4_ifaces()?
             .into_iter()
             .map(|(name, ip)| {
-                let is_tunnel = is_tunnel_iface(&name)
+                #[cfg(target_os = "linux")]
+                let tunnel_match = is_linux_tunnel_iface(&name);
+                #[cfg(not(target_os = "linux"))]
+                let tunnel_match = is_tunnel_iface(&name);
+                let is_tunnel = tunnel_match
                     || name == "lo"
                     || name.eq_ignore_ascii_case("Loopback Pseudo-Interface 1");
                 #[cfg(target_os = "linux")]
@@ -745,7 +819,7 @@ pub fn auto_detect_non_tun_ipv4() -> Result<Ipv4Addr> {
 
         let mut non_tun_defaults: Vec<_> = candidates
             .into_iter()
-            .filter(|r| !is_tunnel_iface(&r.iface))
+            .filter(|r| !is_linux_tunnel_iface(&r.iface))
             .collect();
         non_tun_defaults.sort_by_key(|r| r.metric);
 
@@ -767,10 +841,11 @@ pub fn auto_detect_non_tun_ipv4() -> Result<Ipv4Addr> {
         ifaces.sort_by_key(|(name, _)| iface_preference_score(name));
 
         for (name, ip) in &ifaces {
-            if is_tunnel_iface(name)
-                || name == "lo"
-                || name.eq_ignore_ascii_case("Loopback Pseudo-Interface 1")
-            {
+            #[cfg(target_os = "linux")]
+            let tunnel = is_linux_tunnel_iface(name);
+            #[cfg(not(target_os = "linux"))]
+            let tunnel = is_tunnel_iface(name);
+            if tunnel || name == "lo" || name.eq_ignore_ascii_case("Loopback Pseudo-Interface 1") {
                 continue;
             }
             eprintln!("[bypass] fallback iface={name} ip={ip}");
@@ -905,14 +980,37 @@ mod tests {
 
     #[test]
     fn tunnel_names() {
-        assert!(is_tunnel_iface("tun0"));
-        assert!(is_tunnel_iface("wg0"));
-        assert!(is_tunnel_iface("tap1"));
-        assert!(is_tunnel_iface("utun3"));
-        assert!(is_tunnel_iface("Wintun"));
-        assert!(!is_tunnel_iface("eth0"));
-        assert!(!is_tunnel_iface("enp0s3"));
-        assert!(!is_tunnel_iface("wlan0"));
+        for tun in [
+            "tun0",
+            "wg0",
+            "wg-mullvad",
+            "tap1",
+            "TAP-Windows Adapter V9",
+            "utun3",
+            "Wintun",
+            "tailscale0",
+            "ztcf23aa10",
+            "CloudflareWARP",
+            "nordlynx",
+            "Mihomo",
+            "sing-box",
+        ] {
+            assert!(is_tunnel_iface(tun), "expected tunnel: {tun}");
+        }
+        for phys in [
+            "eth0",
+            "enp0s3",
+            "wlan0",
+            "Intel(R) Ethernet Performance Tuning",
+            "Killer E3100G Opportunistic Adapter",
+            "AWG-25G PCIe NIC",
+            "Realtek Gaming 2.5GbE Family Controller",
+        ] {
+            assert!(
+                !is_tunnel_iface(phys),
+                "false positive on physical NIC: {phys}"
+            );
+        }
     }
 
     #[test]

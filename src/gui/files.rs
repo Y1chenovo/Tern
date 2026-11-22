@@ -5,7 +5,6 @@ use super::*;
 use egui::{Align, Color32, CornerRadius, Layout, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2};
 use std::future::Future;
 use std::pin::Pin;
-use std::thread;
 
 type OpFuture = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
 
@@ -117,12 +116,10 @@ impl GuiApp {
             );
             (t, gen)
         };
-        let runtime = Arc::clone(&self.runtime);
         let ctx = self.ctx.clone();
         let zh = self.zh();
-        thread::spawn(move || {
-            let result =
-                runtime.block_on(async move { session::sftp_list(&handle, &target).await });
+        self.runtime.spawn(async move {
+            let result = session::sftp_list(&handle, &target).await;
             if let Ok(mut s) = shared.lock() {
                 if s.files.gen != gen {
                     // The user has navigated again since; this answer is stale.
@@ -180,21 +177,16 @@ impl GuiApp {
             }
             (s.files.cwd.clone(), s.files.gen)
         };
-        let runtime = Arc::clone(&self.runtime);
         let ctx = self.ctx.clone();
-        thread::spawn(move || {
-            let shared2 = Arc::clone(&shared);
-            let result = runtime.block_on(async move {
-                let r = op(Arc::clone(&handle)).await;
-                // Refresh even after a partial failure (e.g. some deletes worked).
-                if let Ok((next, entries)) = session::sftp_list(&handle, &cwd).await {
-                    apply_listing(&shared2, gen, next, entries);
-                }
-                r
-            });
+        self.runtime.spawn(async move {
+            let r = op(Arc::clone(&handle)).await;
+            // Refresh even after a partial failure (e.g. some deletes worked).
+            if let Ok((next, entries)) = session::sftp_list(&handle, &cwd).await {
+                apply_listing(&shared, gen, next, entries);
+            }
             if let Ok(mut s) = shared.lock() {
                 s.files.busy = false;
-                match result {
+                match r {
                     Ok(msg) => {
                         s.files.status = msg;
                         s.files.error = false;
@@ -334,20 +326,20 @@ impl GuiApp {
         let io = Arc::new(Mutex::new(EditorIo::default()));
         if is_new {
             let io2 = Arc::clone(&io);
-            let runtime = Arc::clone(&self.runtime);
             let ctx = self.ctx.clone();
             let p = path.clone();
             let shared = Arc::clone(&self.sessions[idx].shared);
             let (dir, gen) = (cwd.clone(), shared.lock().unwrap().files.gen);
-            thread::spawn(move || {
-                let r = runtime.block_on(async {
+            self.runtime.spawn(async move {
+                let r = async {
                     session::sftp_create_file(&handle, &p).await?;
                     if let Ok((next, entries)) = session::sftp_list(&handle, &dir).await {
                         apply_listing(&shared, gen, next, entries);
                     }
                     // Read it back for its stamp (it's empty).
                     session::sftp_read_text(&handle, &p, 4 * 1024 * 1024).await
-                });
+                }
+                .await;
                 io2.lock().unwrap().loaded = Some(r.map_err(|e| format!("{e:#}")));
                 ctx.request_repaint();
             });
@@ -381,6 +373,9 @@ impl GuiApp {
             find_focus: false,
             find_cur: 0,
             pending_select: None,
+            text_rev: 0,
+            cached_matches: None,
+            cached_galley: None,
         });
     }
 
@@ -390,12 +385,9 @@ impl GuiApp {
         path: String,
         io: Arc<Mutex<EditorIo>>,
     ) {
-        let runtime = Arc::clone(&self.runtime);
         let ctx = self.ctx.clone();
-        thread::spawn(move || {
-            let r = runtime.block_on(async move {
-                session::sftp_read_text(&handle, &path, 4 * 1024 * 1024).await
-            });
+        self.runtime.spawn(async move {
+            let r = session::sftp_read_text(&handle, &path, 4 * 1024 * 1024).await;
             io.lock().unwrap().loaded = Some(r.map_err(|e| format!("{e:#}")));
             ctx.request_repaint();
         });
@@ -453,12 +445,9 @@ impl GuiApp {
         let path = ed.path.clone();
         let expect = if force { None } else { ed.stamp };
         let io = Arc::clone(&ed.io);
-        let runtime = Arc::clone(&self.runtime);
         let ctx = self.ctx.clone();
-        thread::spawn(move || {
-            let r = runtime.block_on(async move {
-                session::sftp_write_file(&handle, &path, &data, expect).await
-            });
+        self.runtime.spawn(async move {
+            let r = session::sftp_write_file(&handle, &path, &data, expect).await;
             io.lock().unwrap().saved = Some(r.map_err(|e| {
                 (
                     e.downcast_ref::<session::RemoteChanged>().is_some(),
@@ -532,7 +521,6 @@ impl GuiApp {
         } else {
             format!("{} + {} more", names[0], count - 1)
         };
-        let runtime = Arc::clone(&self.runtime);
         let ctx = self.ctx.clone();
         let cancel = start_transfer(&shared, &label, zh, true);
         // total size from the listing (best effort; folders start at 0 until enumerated)
@@ -550,10 +538,10 @@ impl GuiApp {
                 .sum()
         };
         let remotes: Vec<String> = names.iter().map(|n| join_remote(&cwd, n)).collect();
-        thread::spawn(move || {
+        self.runtime.spawn(async move {
             let progress_shared = Arc::clone(&shared);
             let ctx2 = ctx.clone();
-            let job_res = runtime.block_on(async {
+            let job_res = {
                 let (tx, mut rx) = mpsc::unbounded_channel::<session::TransferProgress>();
                 let h = Arc::clone(&handle);
                 let d = dir.clone();
@@ -573,7 +561,7 @@ impl GuiApp {
                     ctx2.request_repaint();
                 }
                 job.await
-            });
+            };
             match job_res {
                 Ok((outcome, Ok(()))) => {
                     finish_transfer(&shared, Ok(Ok(())), zh, outcome.saved_path.clone());
@@ -691,8 +679,25 @@ impl GuiApp {
     }
 
     pub(super) fn cd_in_terminal(&mut self, idx: usize, remote_dir: &str) {
-        let quoted = shell_single_quote(remote_dir);
-        let cmd = format!("cd {quoted}\r");
+        if self
+            .sessions
+            .get(idx)
+            .is_some_and(|s| s.term.is_alternate_screen())
+        {
+            if let Some(slot) = self.sessions.get_mut(idx) {
+                slot.view = CenterView::Terminal;
+            }
+            self.focus_term = true;
+            self.toast_msg(
+                self.t(
+                    "终端正在运行全屏程序（如 vim / htop），请先退出后再跳转目录",
+                    "Exit the full-screen terminal app (e.g. vim / htop) before changing directory",
+                ),
+                StatusKind::Info,
+            );
+            return;
+        }
+        let cmd = format_cd_command(remote_dir);
         self.send_bytes(idx, cmd.into_bytes());
         if let Some(slot) = self.sessions.get_mut(idx) {
             slot.view = CenterView::Terminal;
@@ -746,8 +751,12 @@ impl GuiApp {
                         ("777", 0o777),
                     ] {
                         if w::button_sized(ui, Kind::Secondary, None, lbl, true, 54.0).clicked() {
-                            ch.mode = val;
-                            ch.octal = format!("{val:03o}");
+                            ch.mode = (ch.mode & 0o7000) | val;
+                            ch.octal = if ch.mode > 0o777 {
+                                format!("{:04o}", ch.mode)
+                            } else {
+                                format!("{:03o}", ch.mode)
+                            };
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -899,7 +908,6 @@ impl GuiApp {
             (s.files.cwd.clone(), s.files.gen)
         };
         let zh = self.zh();
-        let runtime = Arc::clone(&self.runtime);
         let ctx = self.ctx.clone();
         let count = paths.len();
         let first = paths[0]
@@ -916,13 +924,34 @@ impl GuiApp {
             first
         };
         let cancel = start_transfer(&shared, &label, zh, false);
-        thread::spawn(move || {
-            // Walking a big folder can take a moment — do it off the UI thread.
-            let super::UploadPlan {
+        self.runtime.spawn(async move {
+            // Walking a big folder can take a moment — do it off the async workers.
+            let cwd_plan = cwd.clone();
+            let Ok(super::UploadPlan {
                 dirs,
                 items,
                 skipped,
-            } = plan_upload(&paths, &cwd);
+            }) = tokio::task::spawn_blocking(move || plan_upload(&paths, &cwd_plan)).await
+            else {
+                finish_transfer(
+                    &shared,
+                    Ok(Err(anyhow::anyhow!("upload planning failed"))),
+                    zh,
+                    None,
+                );
+                ctx.request_repaint();
+                return;
+            };
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                finish_transfer(
+                    &shared,
+                    Ok(Err(anyhow::Error::new(session::Cancelled))),
+                    zh,
+                    None,
+                );
+                ctx.request_repaint();
+                return;
+            }
             if dirs.is_empty() && items.is_empty() {
                 if let Ok(mut s) = shared.lock() {
                     s.transfer.active = false;
@@ -944,7 +973,7 @@ impl GuiApp {
             if let Ok(mut s) = shared.lock() {
                 s.transfer.total = grand;
             }
-            let result = runtime.block_on(async move {
+            let result = {
                 let (tx, mut rx) = mpsc::unbounded_channel::<session::TransferProgress>();
                 let h = Arc::clone(&handle);
                 let job = tokio::spawn(async move {
@@ -962,7 +991,7 @@ impl GuiApp {
                     apply_listing(&progress_shared, gen, next, entries);
                 }
                 r
-            });
+            };
             finish_transfer(&shared, result, zh, None);
             if !skipped.is_empty() {
                 if let Ok(mut s) = shared.lock() {
@@ -2186,6 +2215,9 @@ impl GuiApp {
                         ed.line_count = text.lines().count().max(1);
                         ed.original = text.clone();
                         ed.text = text;
+                        ed.text_rev = ed.text_rev.wrapping_add(1);
+                        ed.cached_matches = None;
+                        ed.cached_galley = None;
                     }
                     Err(e) => {
                         ed.error = e;
@@ -2335,8 +2367,7 @@ impl GuiApp {
                     let mut do_replace_all = false;
                     let mut close_find = false;
 
-                    let mut matches =
-                        super::highlight::find_matches(&ed.text, &ed.find_query, ed.find_case);
+                    let mut matches = ed.current_matches();
                     if !matches.is_empty() {
                         ed.find_cur = ed.find_cur.min(matches.len() - 1);
                     } else {
@@ -2367,11 +2398,7 @@ impl GuiApp {
                                 }
                                 if rf.changed() {
                                     ed.find_cur = 0;
-                                    matches = super::highlight::find_matches(
-                                        &ed.text,
-                                        &ed.find_query,
-                                        ed.find_case,
-                                    );
+                                    matches = ed.current_matches();
                                     if let Some(&(s, e)) = matches.first() {
                                         ed.pending_select =
                                             Some(super::highlight::byte_range_to_char_range(
@@ -2441,11 +2468,7 @@ impl GuiApp {
                                 {
                                     ed.find_case = cs;
                                     ed.find_cur = 0;
-                                    matches = super::highlight::find_matches(
-                                        &ed.text,
-                                        &ed.find_query,
-                                        ed.find_case,
-                                    );
+                                    matches = ed.current_matches();
                                     if let Some(&(s, e)) = matches.first() {
                                         ed.pending_select =
                                             Some(super::highlight::byte_range_to_char_range(
@@ -2535,6 +2558,7 @@ impl GuiApp {
                         );
                         if count > 0 {
                             ed.text = next;
+                            ed.text_rev = ed.text_rev.wrapping_add(1);
                             ed.dirty = ed.text != ed.original;
                             ed.confirm_discard = false;
                             ed.line_count = ed.text.lines().count().max(1);
@@ -2544,14 +2568,11 @@ impl GuiApp {
                     } else if do_replace {
                         if let Some(&(s, e)) = matches.get(ed.find_cur) {
                             ed.text.replace_range(s..e, &ed.replace_text);
+                            ed.text_rev = ed.text_rev.wrapping_add(1);
                             ed.dirty = ed.text != ed.original;
                             ed.confirm_discard = false;
                             ed.line_count = ed.text.lines().count().max(1);
-                            let next_matches = super::highlight::find_matches(
-                                &ed.text,
-                                &ed.find_query,
-                                ed.find_case,
-                            );
+                            let next_matches = ed.current_matches();
                             if !next_matches.is_empty() {
                                 ed.find_cur = ed.find_cur.min(next_matches.len() - 1);
                                 let (ns, ne) = next_matches[ed.find_cur];
@@ -2620,6 +2641,11 @@ impl GuiApp {
                         ui.painter().galley(r.min, g, term_dark.fg);
                     });
                 } else {
+                    let cached_matches = if ed.find_open && !ed.find_query.is_empty() {
+                        Some((ed.text.len(), ed.current_matches()))
+                    } else {
+                        None
+                    };
                     egui::ScrollArea::both()
                         .id_salt(("editor_scroll", &ed.path))
                         .auto_shrink([false, false])
@@ -2630,9 +2656,30 @@ impl GuiApp {
                             let find_query = ed.find_query.clone();
                             let find_case = ed.find_case;
                             let find_cur = ed.find_cur;
+                            let galley_cache = &mut ed.cached_galley;
                             let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                                let gkey = EditorGalleyKey {
+                                    wrap_bits: wrap_width.to_bits(),
+                                    dark: t.dark,
+                                    find_open,
+                                    find_query: find_query.clone(),
+                                    find_case,
+                                    find_cur,
+                                };
+                                if let Some((prev_k, prev_g)) = &*galley_cache {
+                                    if prev_k == &gkey && prev_g.job.text.as_str() == text {
+                                        return Arc::clone(prev_g);
+                                    }
+                                }
                                 let live_matches = if find_open && !find_query.is_empty() {
-                                    super::highlight::find_matches(text, &find_query, find_case)
+                                    match &cached_matches {
+                                        Some((len, m)) if *len == text.len() => m.clone(),
+                                        _ => super::highlight::find_matches(
+                                            text,
+                                            &find_query,
+                                            find_case,
+                                        ),
+                                    }
                                 } else {
                                     Vec::new()
                                 };
@@ -2648,7 +2695,9 @@ impl GuiApp {
                                 let job = super::highlight::build_editor_job(
                                     text, &font, wrap_width, &hl,
                                 );
-                                ui.fonts(|f| f.layout_job(job))
+                                let galley = ui.fonts(|f| f.layout_job(job));
+                                *galley_cache = Some((gkey, Arc::clone(&galley)));
+                                galley
                             };
                             let te = egui::TextEdit::multiline(&mut ed.text)
                                 .id(egui::Id::new(("editor_text", &ed.path)))
@@ -2669,6 +2718,7 @@ impl GuiApp {
                             let out = te.show(ui);
                             if out.response.changed() {
                                 // Compare only when something was typed, not every frame.
+                                ed.text_rev = ed.text_rev.wrapping_add(1);
                                 ed.dirty = ed.text != ed.original;
                                 ed.confirm_discard = false;
                                 ed.line_count = ed.text.lines().count().max(1);
@@ -2858,6 +2908,32 @@ impl GuiApp {
     }
 }
 
+impl FileEditor {
+    fn current_matches(&mut self) -> Vec<(usize, usize)> {
+        if self.find_query.is_empty() {
+            return Vec::new();
+        }
+        let key = EditorMatchKey {
+            text_rev: self.text_rev,
+            text_len: self.text.len(),
+            query: self.find_query.clone(),
+            case_sensitive: self.find_case,
+        };
+        if let Some((k, m)) = &self.cached_matches {
+            if k == &key {
+                return m.clone();
+            }
+        }
+        let m = super::highlight::find_matches(&self.text, &self.find_query, self.find_case);
+        self.cached_matches = Some((key, m.clone()));
+        m
+    }
+}
+
+fn format_cd_command(remote_dir: &str) -> String {
+    format!("cd -- {}\r", shell_single_quote(remote_dir))
+}
+
 /// POSIX shell single-quote escaping for `cd` paths (preserves `~` expansion).
 fn shell_single_quote(path: &str) -> String {
     let clean: String = path.chars().filter(|c| !c.is_control()).collect();
@@ -2903,6 +2979,11 @@ mod tests {
         );
         assert_eq!(shell_single_quote("/tmp/it's"), "'/tmp/it'\\''s'");
         assert_eq!(shell_single_quote("/tmp/bad\nrm -rf"), "'/tmp/badrm -rf'");
+        assert_eq!(
+            format_cd_command("-leading-dash"),
+            "cd -- '-leading-dash'\r"
+        );
+        assert_eq!(format_cd_command("~/sub"), "cd -- ~/'sub'\r");
     }
 
     #[test]

@@ -585,6 +585,35 @@ struct SshHostOpts {
     user: Option<String>,
     port: Option<u16>,
     identity: Option<String>,
+    forward: Option<(String, String)>,
+    bind_addr: Option<String>,
+    bind_iface: Option<String>,
+}
+
+impl SshHostOpts {
+    fn merge_missing_from(&mut self, other: &Self) {
+        if self.hostname.is_none() {
+            self.hostname = other.hostname.clone();
+        }
+        if self.user.is_none() {
+            self.user = other.user.clone();
+        }
+        if self.port.is_none() {
+            self.port = other.port;
+        }
+        if self.identity.is_none() {
+            self.identity = other.identity.clone();
+        }
+        if self.forward.is_none() {
+            self.forward = other.forward.clone();
+        }
+        if self.bind_addr.is_none() {
+            self.bind_addr = other.bind_addr.clone();
+        }
+        if self.bind_iface.is_none() {
+            self.bind_iface = other.bind_iface.clone();
+        }
+    }
 }
 
 fn split_ssh_config_line(line: &str) -> Vec<String> {
@@ -628,11 +657,148 @@ fn expand_tilde_path(raw: &str, home_dir: Option<&std::path::Path>) -> String {
     raw.to_string()
 }
 
-/// Parse an OpenSSH `config` file into Tern host profiles under folder `"SSH Config"`.
-pub fn parse_ssh_config(text: &str, home_dir: Option<&std::path::Path>) -> Vec<Profile> {
-    let mut global_defaults = SshHostOpts::default();
-    let mut blocks: Vec<(Vec<String>, SshHostOpts)> = Vec::new();
-    let mut current_patterns: Option<Vec<String>> = None;
+fn ssh_glob_match(pat: &str, text: &str) -> bool {
+    let p: Vec<char> = pat.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let t: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (None::<usize>, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn ssh_host_patterns_match(pats: &[String], alias: &str) -> bool {
+    let mut matched_positive = false;
+    for pat in pats {
+        if let Some(neg) = pat.strip_prefix('!') {
+            if !neg.is_empty() && ssh_glob_match(neg, alias) {
+                return false;
+            }
+        } else if !pat.is_empty() && ssh_glob_match(pat, alias) {
+            matched_positive = true;
+        }
+    }
+    matched_positive
+}
+
+fn expand_ssh_hostname(raw: &str, alias: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.peek().copied() {
+                Some('h') => {
+                    chars.next();
+                    out.push_str(alias);
+                    continue;
+                }
+                Some('%') => {
+                    chars.next();
+                    out.push('%');
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn normalize_forward_listen(raw: &str) -> String {
+    let s = raw.trim();
+    if let Some(port) = s.strip_prefix("*:") {
+        format!("0.0.0.0:{port}")
+    } else if let Some(port) = s.strip_prefix(':') {
+        format!("127.0.0.1:{port}")
+    } else if !s.contains(':') && s.parse::<u16>().is_ok() {
+        format!("127.0.0.1:{s}")
+    } else {
+        s.to_string()
+    }
+}
+
+fn default_local_user() -> String {
+    std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("USERNAME").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "root".into())
+}
+
+fn resolve_include_paths(
+    pattern: &str,
+    ssh_dir: Option<&std::path::Path>,
+    home_dir: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    let expanded = expand_tilde_path(pattern, home_dir);
+    let p = PathBuf::from(&expanded);
+    let full = if p.is_absolute() {
+        p
+    } else if let Some(base) = ssh_dir {
+        base.join(p)
+    } else {
+        p
+    };
+    let Some(file_pat) = full.file_name().map(|f| f.to_string_lossy().to_string()) else {
+        return Vec::new();
+    };
+    if !file_pat.contains(['*', '?']) {
+        return if full.is_file() {
+            vec![full]
+        } else {
+            Vec::new()
+        };
+    }
+    let Some(parent) = full.parent() else {
+        return Vec::new();
+    };
+    let Ok(rd) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut matches: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|cand| {
+            cand.is_file()
+                && cand
+                    .file_name()
+                    .map(|n| ssh_glob_match(&file_pat, &n.to_string_lossy()))
+                    .unwrap_or(false)
+        })
+        .collect();
+    matches.sort();
+    matches
+}
+
+fn parse_ssh_config_blocks(
+    text: &str,
+    ssh_dir: Option<&std::path::Path>,
+    home_dir: Option<&std::path::Path>,
+    outer_patterns: Option<Vec<String>>,
+    depth: usize,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    blocks: &mut Vec<(Vec<String>, SshHostOpts)>,
+) {
+    let mut current_patterns: Vec<String> = outer_patterns.unwrap_or_else(|| vec!["*".into()]);
     let mut current_opts = SshHostOpts::default();
     let mut in_match = false;
 
@@ -644,94 +810,159 @@ pub fn parse_ssh_config(text: &str, home_dir: Option<&std::path::Path>) -> Vec<P
         let key = tokens[0].to_ascii_lowercase();
         let rest = &tokens[1..];
         if key == "host" {
-            if let Some(pats) = current_patterns.take() {
-                blocks.push((pats, std::mem::take(&mut current_opts)));
-            }
+            blocks.push((current_patterns, std::mem::take(&mut current_opts)));
             in_match = false;
-            current_patterns = Some(rest.to_vec());
-            current_opts = SshHostOpts::default();
+            current_patterns = rest.to_vec();
             continue;
         }
         if key == "match" {
-            if let Some(pats) = current_patterns.take() {
-                blocks.push((pats, std::mem::take(&mut current_opts)));
-            }
+            blocks.push((
+                std::mem::take(&mut current_patterns),
+                std::mem::take(&mut current_opts),
+            ));
             in_match = true;
             continue;
         }
         if in_match || rest.is_empty() {
             continue;
         }
-        let target = if current_patterns.is_some() {
-            &mut current_opts
-        } else {
-            &mut global_defaults
-        };
-        let val = rest.join(" ");
-        match key.as_str() {
-            "hostname" if target.hostname.is_none() => target.hostname = Some(val),
-            "user" if target.user.is_none() => target.user = Some(val),
-            "port" if target.port.is_none() => {
-                if let Some(p) = val.parse::<u16>().ok().filter(|&p| p > 0) {
-                    target.port = Some(p);
+        if key == "include" && depth < 8 {
+            blocks.push((current_patterns.clone(), std::mem::take(&mut current_opts)));
+            for pat in rest {
+                for inc_path in resolve_include_paths(pat, ssh_dir, home_dir) {
+                    let canon = fs::canonicalize(&inc_path).unwrap_or_else(|_| inc_path.clone());
+                    if !visited.insert(canon.clone()) {
+                        continue;
+                    }
+                    if let Ok(inc_text) = fs::read_to_string(&inc_path) {
+                        parse_ssh_config_blocks(
+                            &inc_text,
+                            ssh_dir,
+                            home_dir,
+                            Some(current_patterns.clone()),
+                            depth + 1,
+                            visited,
+                            blocks,
+                        );
+                    }
+                    visited.remove(&canon);
                 }
             }
-            "identityfile" if target.identity.is_none() => {
-                target.identity = Some(expand_tilde_path(&val, home_dir));
+            continue;
+        }
+
+        let val = rest.join(" ");
+        match key.as_str() {
+            "hostname" if current_opts.hostname.is_none() => current_opts.hostname = Some(val),
+            "user" if current_opts.user.is_none() => current_opts.user = Some(val),
+            "port" if current_opts.port.is_none() => {
+                if let Some(p) = val.parse::<u16>().ok().filter(|&p| p > 0) {
+                    current_opts.port = Some(p);
+                }
+            }
+            "identityfile" if current_opts.identity.is_none() => {
+                current_opts.identity = Some(expand_tilde_path(&val, home_dir));
+            }
+            "localforward" if current_opts.forward.is_none() && rest.len() >= 2 => {
+                let listen = normalize_forward_listen(&rest[0]);
+                let remote = rest[1].trim().to_string();
+                if !listen.is_empty() && !remote.is_empty() {
+                    current_opts.forward = Some((listen, remote));
+                }
+            }
+            "bindaddress" if current_opts.bind_addr.is_none() => {
+                current_opts.bind_addr = Some(val);
+            }
+            "bindinterface" if current_opts.bind_iface.is_none() => {
+                current_opts.bind_iface = Some(val);
             }
             _ => {}
         }
     }
-    if let Some(pats) = current_patterns.take() {
-        blocks.push((pats, current_opts));
+    if !current_patterns.is_empty() {
+        blocks.push((current_patterns, current_opts));
     }
+}
 
-    // Collect `Host *` defaults alongside top-of-file defaults (first-match wins).
-    for (pats, opts) in &blocks {
-        if pats.iter().any(|p| p == "*") {
-            if global_defaults.hostname.is_none() {
-                global_defaults.hostname = opts.hostname.clone();
+fn profiles_from_ssh_blocks(blocks: &[(Vec<String>, SshHostOpts)]) -> Vec<Profile> {
+    let fallback_user = default_local_user();
+    let mut seen_aliases = std::collections::HashSet::new();
+    let mut aliases = Vec::new();
+    for (pats, _) in blocks {
+        for pat in pats {
+            if pat.is_empty() || pat.contains(['*', '?', '!']) {
+                continue;
             }
-            if global_defaults.user.is_none() {
-                global_defaults.user = opts.user.clone();
-            }
-            if global_defaults.port.is_none() {
-                global_defaults.port = opts.port;
-            }
-            if global_defaults.identity.is_none() {
-                global_defaults.identity = opts.identity.clone();
+            if seen_aliases.insert(pat.to_ascii_lowercase()) {
+                aliases.push(pat.clone());
             }
         }
     }
 
     let mut out = Vec::new();
-    for (pats, opts) in blocks {
-        for pat in pats {
-            if pat.is_empty() || pat.contains(['*', '?', '!']) {
-                continue;
+    for alias in aliases {
+        let mut merged = SshHostOpts::default();
+        for (pats, opts) in blocks {
+            if ssh_host_patterns_match(pats, &alias) {
+                merged.merge_missing_from(opts);
             }
-            let mut p = Profile::new_blank(&pat);
-            p.folder = "SSH Config".into();
-            p.host = opts
-                .hostname
-                .clone()
-                .or_else(|| global_defaults.hostname.clone())
-                .unwrap_or_else(|| pat.clone());
-            p.user = opts
-                .user
-                .clone()
-                .or_else(|| global_defaults.user.clone())
-                .unwrap_or_else(|| "root".into());
-            p.port = opts.port.or(global_defaults.port).unwrap_or(22);
-            p.identity = opts
-                .identity
-                .clone()
-                .or_else(|| global_defaults.identity.clone())
-                .unwrap_or_default();
-            out.push(p);
         }
+        let mut p = Profile::new_blank(&alias);
+        p.folder = "SSH Config".into();
+        p.host = merged
+            .hostname
+            .as_deref()
+            .map(|h| expand_ssh_hostname(h, &alias))
+            .unwrap_or_else(|| alias.clone());
+        p.user = merged.user.unwrap_or_else(|| fallback_user.clone());
+        p.port = merged.port.unwrap_or(22);
+        p.identity = merged.identity.unwrap_or_default();
+        if let Some((fl, fr)) = merged.forward {
+            p.forward_local = fl;
+            p.forward_remote = fr;
+        }
+        if let Some(iface) = merged.bind_iface.filter(|s| !s.is_empty()) {
+            p.bind_mode = BindModePref::Iface;
+            p.bind_iface = iface;
+        } else if let Some(addr) = merged.bind_addr.filter(|s| !s.is_empty()) {
+            p.bind_mode = BindModePref::Addr;
+            p.bind_addr = addr;
+        }
+        out.push(p);
     }
     out
+}
+
+/// Load and parse `~/.ssh/config` from disk (including `Include` directives).
+pub fn load_ssh_config(path: &std::path::Path) -> Result<Vec<Profile>> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let ssh_dir = path.parent();
+    let home_dir = ssh_dir.and_then(|p| p.parent());
+    let mut visited = std::collections::HashSet::new();
+    if let Ok(canon) = fs::canonicalize(path) {
+        visited.insert(canon);
+    }
+    let mut blocks = Vec::new();
+    parse_ssh_config_blocks(&text, ssh_dir, home_dir, None, 0, &mut visited, &mut blocks);
+    Ok(profiles_from_ssh_blocks(&blocks))
+}
+
+/// Parse an OpenSSH `config` string into Tern host profiles under folder `"SSH Config"`.
+#[cfg(test)]
+fn parse_ssh_config(text: &str, home_dir: Option<&std::path::Path>) -> Vec<Profile> {
+    let ssh_dir = home_dir.map(|h| h.join(".ssh"));
+    let mut visited = std::collections::HashSet::new();
+    let mut blocks = Vec::new();
+    parse_ssh_config_blocks(
+        text,
+        ssh_dir.as_deref(),
+        home_dir,
+        None,
+        0,
+        &mut visited,
+        &mut blocks,
+    );
+    profiles_from_ssh_blocks(&blocks)
 }
 
 /// Append `imported` profiles into `existing`, skipping duplicates. Returns `(added, skipped)`.
@@ -1110,6 +1341,59 @@ Host *
             parsed[2].identity,
             home.join(".ssh/id_ed25519").display().to_string()
         );
+    }
+
+    #[test]
+    fn ssh_config_supports_includes_percent_h_forwards_and_bind_options() {
+        let dir = std::env::temp_dir().join(format!("tern-sshcfg-{}", new_id()));
+        let inc_dir = dir.join(".ssh").join("config.d");
+        fs::create_dir_all(&inc_dir).unwrap();
+
+        fs::write(
+            inc_dir.join("10-corp.conf"),
+            r#"
+Host app-1
+    HostName %h.corp.example.com
+    LocalForward 8080 127.0.0.1:80
+    BindAddress 192.168.1.50
+
+Host edge-gw
+    HostName 203.0.113.20
+    BindInterface eth0
+"#,
+        )
+        .unwrap();
+
+        let main_cfg = dir.join(".ssh").join("config");
+        fs::write(
+            &main_cfg,
+            r#"
+Include config.d/*.conf
+
+Host *.corp.example.com app-* !app-blocked
+    User deploy
+    Port 2222
+"#,
+        )
+        .unwrap();
+
+        let parsed = load_ssh_config(&main_cfg).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "app-1");
+        assert_eq!(parsed[0].host, "app-1.corp.example.com");
+        assert_eq!(parsed[0].user, "deploy");
+        assert_eq!(parsed[0].port, 2222);
+        assert_eq!(parsed[0].forward_local, "127.0.0.1:8080");
+        assert_eq!(parsed[0].forward_remote, "127.0.0.1:80");
+        assert_eq!(parsed[0].bind_mode, BindModePref::Addr);
+        assert_eq!(parsed[0].bind_addr, "192.168.1.50");
+
+        assert_eq!(parsed[1].name, "edge-gw");
+        assert_eq!(parsed[1].host, "203.0.113.20");
+        assert_eq!(parsed[1].bind_mode, BindModePref::Iface);
+        assert_eq!(parsed[1].bind_iface, "eth0");
     }
 
     #[test]

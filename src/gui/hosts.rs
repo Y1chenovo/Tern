@@ -744,19 +744,19 @@ impl GuiApp {
             );
             return;
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.toast_msg(
-                    self.t("未找到 ~/.ssh/config", "~/.ssh/config not found"),
-                    StatusKind::Info,
-                );
-                return;
-            }
+        if !path.exists() {
+            self.toast_msg(
+                self.t("未找到 ~/.ssh/config", "~/.ssh/config not found"),
+                StatusKind::Info,
+            );
+            return;
+        }
+        let parsed = match profiles::load_ssh_config(&path) {
+            Ok(p) => p,
             Err(e) => {
                 self.toast_msg(
                     format!(
-                        "{}: {e}",
+                        "{}: {e:#}",
                         self.t("读取 ~/.ssh/config 失败", "Failed to read ~/.ssh/config")
                     ),
                     StatusKind::Error,
@@ -764,8 +764,6 @@ impl GuiApp {
                 return;
             }
         };
-        let home_dir = path.parent().and_then(|p| p.parent());
-        let parsed = profiles::parse_ssh_config(&text, home_dir);
         if parsed.is_empty() {
             self.toast_msg(
                 self.t(

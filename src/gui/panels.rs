@@ -1863,10 +1863,14 @@ impl GuiApp {
                 return;
             }
             let text = std::mem::take(&mut self.cmd_input);
-            let mut bytes: Vec<u8> = text.replace("\r\n", "\n").replace('\n', "\r").into_bytes();
-            bytes.push(b'\r');
             for &i in targets {
-                self.send_bytes(i, bytes.clone());
+                if let Some(bytes) = self
+                    .sessions
+                    .get(i)
+                    .map(|slot| slot.term.encode_command(&text))
+                {
+                    self.send_bytes(i, bytes);
+                }
                 if let Some(slot) = self.sessions.get_mut(i) {
                     slot.term.scroll_to_bottom();
                 }

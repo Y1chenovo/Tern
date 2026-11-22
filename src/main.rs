@@ -1,6 +1,6 @@
 //! Tern — interactive SSH client that keeps the TCP path off the local TUN/VPN.
 //!
-//! See README.md (中文) for motivation, bypass details, and usage.
+//! See README.md and README.zh-CN.md for motivation, bypass details, and usage.
 
 // GUI build: WINDOWS subsystem so double-click does not flash a console and exit.
 // CLI-only build (--no-default-features) keeps the default CONSOLE subsystem.

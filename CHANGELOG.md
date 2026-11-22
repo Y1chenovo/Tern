@@ -2,6 +2,20 @@
 
 All notable user-facing changes to **Tern** are documented in this file.
 
+## v1.0.1 (2026-11-23)
+
+### Bug Fixes & Hardening
+- **Safe SFTP → Terminal `cd`**: Blocks sending `cd` keystrokes while a full-screen terminal app (`vim`, `htop`, `less`) owns the alternate screen, and adds `--` before the quoted path so dash-prefixed directory names never fail as flags.
+- **Deterministic Port-Forward Teardown**: Explicitly stops and awaits local `-L` port-forward listeners before session teardown finishes (both on clean exit and network drops), preventing lingering bound ports when minimized or `Address already in use` errors on fast reconnects.
+- **Atomic Session Close & Credential Persistence**: Unifies closing notices and authentication generation tracking inside `SharedUi` so closing banners never precede trailing PTY output and ultra-short login sessions reliably persist remembered passwords.
+- **Accurate Tunnel Interface Detection**: Replaces greedy short-prefix substring matching (`tun`/`tap`/`wg`) with token-boundary checks to prevent false positives on physical NIC descriptions (e.g. `"Tuning"`, `"AWG"`), adds `tailscale`/`zerotier`/`CloudflareWARP`/`Mihomo`/`sing-box` signatures, and inspects Linux `/sys/class/net/<iface>` (`tun_flags`, ARP hardware type, `uevent`) to detect custom-named tunnels.
+- **Complete `~/.ssh/config` Importer**: Adds support for `Include` globs, wildcard & `!negated` `Host` patterns, `%h` hostname expansion, `LocalForward`, `BindAddress`, `BindInterface`, and local OS username fallback.
+
+### Performance & UX Polish
+- **Zero-Allocation Idle Editor Rendering**: Caches syntax-highlighted `Galley` layouts and search match ranges across frames in the built-in file editor.
+- **Shared Tokio Runtime for SFTP UI Tasks**: Replaces per-operation OS thread spawning (`thread::spawn` + `block_on`) in `files.rs` with tasks on the shared runtime.
+- **Bracketed Paste for Multi-Line Commands & `chmod` Special Bits**: Wraps multi-line snippets/commands in bracketed paste when supported by the shell, and preserves `setuid`/`setgid`/`sticky` bits (`0o7000`) when clicking `chmod` octal presets.
+
 ## v1.0.0 (2026-11-19)
 
 Initial public open-source release.

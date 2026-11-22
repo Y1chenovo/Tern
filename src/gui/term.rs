@@ -752,6 +752,12 @@ impl TermView {
         (start, end)
     }
 
+    /// Whether a full-screen application (`vim`, `htop`, `less`, …) currently owns
+    /// the alternate screen buffer.
+    pub fn is_alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
+    }
+
     /// Encode text for the PTY (newline → CR, bracketed paste when requested).
     pub fn encode_paste(&self, text: &str) -> Vec<u8> {
         let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
@@ -765,6 +771,21 @@ impl TermView {
         } else {
             normalized.into_bytes()
         }
+    }
+
+    /// Encode a command (or multi-line snippet) for immediate execution.
+    /// Multi-line scripts use bracketed paste when supported by the remote shell
+    /// so an earlier command reading stdin does not swallow subsequent lines.
+    pub fn encode_command(&self, cmd: &str) -> Vec<u8> {
+        let normalized = cmd.replace("\r\n", "\n");
+        let trimmed = normalized.trim_end_matches(['\r', '\n']);
+        let mut bytes = if trimmed.contains('\n') && self.parser.screen().bracketed_paste() {
+            self.encode_paste(trimmed)
+        } else {
+            trimmed.replace('\n', "\r").into_bytes()
+        };
+        bytes.push(b'\r');
+        bytes
     }
 
     fn scroll_view(&mut self, delta_lines: i32) {
@@ -2530,6 +2551,21 @@ mod notice_tests {
 #[cfg(test)]
 mod anchor_tests {
     use super::*;
+
+    #[test]
+    fn encode_command_uses_bracketed_paste_for_multiline_when_enabled() {
+        let mut t = TermView::new(10, 40, 100);
+        assert_eq!(t.encode_command("df -h"), b"df -h\r");
+        assert_eq!(t.encode_command("a\nb\n"), b"a\rb\r");
+
+        // Enable bracketed paste mode (`CSI ? 2004 h`).
+        t.feed(b"\x1b[?2004h");
+        assert_eq!(t.encode_command("df -h"), b"df -h\r");
+        assert_eq!(
+            t.encode_command("echo 1\necho 2"),
+            b"\x1b[200~echo 1\recho 2\x1b[201~\r"
+        );
+    }
 
     #[test]
     fn anchor_follows_text_with_full_scrollback() {

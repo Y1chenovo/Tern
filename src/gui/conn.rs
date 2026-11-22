@@ -318,19 +318,18 @@ impl GuiApp {
                 ..Default::default()
             };
             s.notices.clear();
+            s.closing_notice = None;
+            s.closing = false;
             s.conn_gen
         };
         let (fwd_tx, fwd_rx) = tokio::sync::watch::channel(false);
         let (input_tx, input_rx) = mpsc::unbounded_channel::<session::ChannelInput>();
         let (ui_tx, ui_rx) = session::output_channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        slot.forward_stop = Some(fwd_tx);
+        slot.forward_stop = Some(fwd_tx.clone());
         slot.input_tx = Some(input_tx);
         slot.stop_tx = Some(stop_tx);
         slot.output_rx = Some(ui_rx);
-        // A fresh flag per attempt: a previous attempt that ends late raises
-        // its own flag, not this one's.
-        slot.disconnect_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         slot.params = params.clone();
         slot.title = title;
         if focus_tab {
@@ -339,7 +338,6 @@ impl GuiApp {
         slot.file_sel.clear();
         let (cols, rows) = slot.term.size();
         let shared = Arc::clone(&slot.shared);
-        let flag = Arc::clone(&slot.disconnect_flag);
         if focus_tab {
             self.active = idx;
             self.tab_scroll_pending = true;
@@ -628,7 +626,7 @@ impl GuiApp {
                     }
                 };
 
-                if let Some((listen, remote_host, remote_port)) =
+                let fwd_join = if let Some((listen, remote_host, remote_port)) =
                     parse_forward(&params.forward_local, &params.forward_remote)
                 {
                     let fwd_handle = Arc::clone(&handle);
@@ -638,7 +636,7 @@ impl GuiApp {
                         s.forward = format!("{listen} → {remote_host}:{remote_port}");
                     }
                     fwd_notice(format!("  -L {listen} → {remote_host}:{remote_port}"), 90);
-                    tokio::spawn(async move {
+                    Some(tokio::spawn(async move {
                         if let Err(e) =
                             session::local_forward(fwd_handle, listen, remote_host, remote_port, fwd_rx).await
                         {
@@ -647,13 +645,16 @@ impl GuiApp {
                             }
                             fwd_notice(format!("port forward failed: {e:#}"), 31);
                         }
-                    });
-                }
+                    }))
+                } else {
+                    None
+                };
 
                 {
                     let mut s = shared.lock().unwrap();
                     s.connected = true;
                     s.connecting = false;
+                    s.authed_gen = my_gen;
                     s.status = if zh {
                         format!("已连接 {user}@{host}:{port}")
                     } else {
@@ -768,7 +769,7 @@ impl GuiApp {
 
                 // PTY output goes straight to the UI, which is woken at once.
                 let ctx_out = ctx.clone();
-                let code = session::drive_channel_io(
+                let io_res = session::drive_channel_io(
                     channel,
                     Arc::clone(&handle),
                     input_rx,
@@ -776,10 +777,15 @@ impl GuiApp {
                     stop_rx,
                     move || ctx_out.request_repaint(),
                 )
-                .await
-                .map_err(|e| format!("{}: {e:#}", if zh { "会话错误" } else { "Session error" }))?;
+                .await;
                 let _ = mon_stop_tx.send(());
+                let _ = fwd_tx.send(true);
                 let _ = mon_join.await;
+                if let Some(fj) = fwd_join {
+                    let _ = fj.await;
+                }
+                let code = io_res
+                    .map_err(|e| format!("{}: {e:#}", if zh { "会话错误" } else { "Session error" }))?;
                 Ok::<u32, String>(code)
             }
             .await;
@@ -800,7 +806,8 @@ impl GuiApp {
             };
             if let Ok(mut s) = shared_after.lock() {
                 if s.conn_gen == my_gen {
-                    s.notices.push((line, color));
+                    s.closing_notice = Some((line, color));
+                    s.closing = true;
                     s.status = msg;
                     s.status_kind = kind;
                     s.connected = false;
@@ -814,7 +821,6 @@ impl GuiApp {
                     s.forward.clear();
                 }
             }
-            flag.store(true, Ordering::SeqCst);
             ctx_after.request_repaint();
         });
     }
@@ -906,14 +912,14 @@ impl GuiApp {
         let mut due_reconnects = Vec::new();
         for i in (0..n).map(|k| (start + k) % n) {
             let slot = &mut self.sessions[i];
-            let (notices, eligible) = {
+            let (notices, closing, closing_notice, eligible) = {
                 let mut s = slot.shared.lock().unwrap();
-                if s.connected && slot.seen_conn_gen != s.conn_gen {
-                    slot.seen_conn_gen = s.conn_gen;
+                if s.authed_gen != 0 && slot.seen_conn_gen != s.authed_gen {
+                    slot.seen_conn_gen = s.authed_gen;
                     slot.ever_connected = true;
                     slot.auto_reconnect_attempts = 0;
                     slot.auto_reconnect_at = None;
-                    if i == active {
+                    if i == active && s.connected {
                         focus_active = true;
                     }
                     if let Some(id) = &slot.params.profile_id {
@@ -923,15 +929,17 @@ impl GuiApp {
                         newly_connected.push((id.clone(), remember));
                     }
                 }
-                (std::mem::take(&mut s.notices), s.auto_reconnect_eligible)
+                (
+                    std::mem::take(&mut s.notices),
+                    std::mem::take(&mut s.closing),
+                    s.closing_notice.take(),
+                    s.auto_reconnect_eligible,
+                )
             };
             // Connection notices ("认证成功…") precede the shell's first output;
             // a closing notice ("已断开") follows the last of it.
-            let closing = slot.disconnect_flag.swap(false, Ordering::SeqCst);
-            if !closing {
-                for (text, color) in notices.iter() {
-                    slot.term.feed_notice(text, *color);
-                }
+            for (text, color) in &notices {
+                slot.term.feed_notice(text, *color);
             }
             let mut got = false;
             if closing {
@@ -963,8 +971,8 @@ impl GuiApp {
                         slot.term.feed_notice(&gap_notice(skipped), 33);
                     }
                 }
-                for (text, color) in notices.iter() {
-                    slot.term.feed_notice(text, *color);
+                if let Some((text, color)) = closing_notice {
+                    slot.term.feed_notice(&text, color);
                 }
                 let has_creds =
                     !slot.params.password.is_empty() || !slot.params.identity.trim().is_empty();

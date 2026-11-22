@@ -345,16 +345,14 @@ impl GuiApp {
                             StatusKind::Info,
                         );
                     } else {
-                        let mut bytes = s
-                            .command
-                            .replace("\r\n", "\n")
-                            .replace('\n', "\r")
-                            .into_bytes();
-                        if !bytes.ends_with(b"\r") {
-                            bytes.push(b'\r');
-                        }
                         for &slot_idx in targets {
-                            self.send_bytes(slot_idx, bytes.clone());
+                            if let Some(bytes) = self
+                                .sessions
+                                .get(slot_idx)
+                                .map(|slot| slot.term.encode_command(&s.command))
+                            {
+                                self.send_bytes(slot_idx, bytes);
+                            }
                             if let Some(slot) = self.sessions.get_mut(slot_idx) {
                                 slot.term.scroll_to_bottom();
                             }

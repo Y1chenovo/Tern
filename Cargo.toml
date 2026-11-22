@@ -1,6 +1,6 @@
 [package]
 name = "tern"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 authors = ["Yichenovo"]
 description = "Tern — SSH & SFTP client with multi-host group control that binds outbound TCP to a non-TUN interface to bypass the local VPN"

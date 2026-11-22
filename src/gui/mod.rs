@@ -23,7 +23,6 @@ use eframe::egui;
 use profiles::{LangPref, ThemePref};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 use tokio::runtime::Runtime;
@@ -154,6 +153,13 @@ struct SharedUi {
     forward: String,
     /// Local notices (connect progress, errors) to print into the terminal.
     notices: Vec<(String, u8)>,
+    /// Final notice printed *after* draining the last PTY output on close.
+    closing_notice: Option<(String, u8)>,
+    /// Raised under the same lock when the current attempt finishes.
+    closing: bool,
+    /// `conn_gen` of the latest attempt that successfully authenticated (kept
+    /// even if the session exits within the same UI frame).
+    authed_gen: u64,
     /// Bumped on every connection attempt: a finished older attempt must not
     /// reset the state of the newer one.
     conn_gen: u64,
@@ -182,6 +188,9 @@ impl SharedUi {
             transfer: TransferUi::default(),
             forward: String::new(),
             notices: Vec::new(),
+            closing_notice: None,
+            closing: false,
+            authed_gen: 0,
             conn_gen: 0,
             auto_reconnect_eligible: false,
         }
@@ -260,7 +269,6 @@ struct SessionSlot {
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
     forward_stop: Option<tokio::sync::watch::Sender<bool>>,
     output_rx: Option<session::OutputSource>,
-    disconnect_flag: Arc<AtomicBool>,
     view: CenterView,
     ever_connected: bool,
     /// `conn_gen` of the last connection seen established (each new one
@@ -301,7 +309,6 @@ impl SessionSlot {
             stop_tx: None,
             forward_stop: None,
             output_rx: None,
-            disconnect_flag: Arc::new(AtomicBool::new(false)),
             view: CenterView::Terminal,
             ever_connected: false,
             seen_conn_gen: 0,
@@ -453,6 +460,24 @@ struct EditorIo {
     saved: Option<Result<Option<session::FileStamp>, (bool, String)>>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct EditorMatchKey {
+    text_rev: u64,
+    text_len: usize,
+    query: String,
+    case_sensitive: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct EditorGalleyKey {
+    wrap_bits: u32,
+    dark: bool,
+    find_open: bool,
+    find_query: String,
+    find_case: bool,
+    find_cur: usize,
+}
+
 /// Built-in editor for a remote text file.
 struct FileEditor {
     tab_uid: u64,
@@ -489,6 +514,9 @@ struct FileEditor {
     find_focus: bool,
     find_cur: usize,
     pending_select: Option<(usize, usize)>,
+    text_rev: u64,
+    cached_matches: Option<(EditorMatchKey, Vec<(usize, usize)>)>,
+    cached_galley: Option<(EditorGalleyKey, Arc<egui::Galley>)>,
 }
 
 struct ChmodPrompt {
